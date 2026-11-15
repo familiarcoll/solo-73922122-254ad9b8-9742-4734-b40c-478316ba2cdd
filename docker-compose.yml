@@ -1,0 +1,55 @@
+services:
+  dns:
+    build: .
+    command: ["python", "-m", "dns.server"]
+    networks:
+      hydronet:
+        ipv4_address: 172.28.0.53
+
+  source:
+    build: .
+    command: ["uvicorn", "source.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    networks:
+      hydronet:
+        ipv4_address: 172.28.0.10
+
+  forbidden:
+    build: .
+    command: ["uvicorn", "forbidden.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    networks:
+      hydronet:
+        ipv4_address: 172.28.0.200
+
+  web:
+    build: .
+    command: ["uvicorn", "collector.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      # 管理员配置:许可网段(172.28.0.0/25 覆盖 web/source/dns,不含禁区 .200)
+      ALLOWED_CIDRS: "172.28.0.0/25"
+      ALLOWED_PORTS: "8080"
+      MAX_REDIRECTS: "3"
+      MAX_BYTES: "262144"
+      FORBIDDEN_STATS_URL: "http://forbidden.hydro.local:8080/stats"
+      DNS_RESET_URL: "http://dns.hydro.local:8081/reset"
+      SCENARIO_SOURCE_BASE: "http://source.hydro.local:8080"
+      SCENARIO_REBIND_URL: "http://rebind.hydro.local:8080/rebind"
+    dns:
+      - 172.28.0.53
+    dns_opt:
+      - "ndots:0"
+    ports:
+      - "8000:8000"
+    networks:
+      hydronet:
+        ipv4_address: 172.28.0.5
+    depends_on:
+      - dns
+      - source
+      - forbidden
+
+networks:
+  hydronet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

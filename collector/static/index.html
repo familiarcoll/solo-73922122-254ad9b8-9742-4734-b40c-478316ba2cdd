@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>水文数据接入采集</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; background: #f4f6f8; color: #1c2733; }
+  header { background: #0f4c81; color: #fff; padding: 14px 22px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 4px 0 0; font-size: 12px; opacity: .85; }
+  main { max-width: 1080px; margin: 18px auto; padding: 0 16px; display: grid; gap: 14px; }
+  section { background: #fff; border: 1px solid #dde3ea; border-radius: 8px; padding: 14px 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #0f4c81; }
+  .scenarios { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .scenarios button { border: 1px solid #0f4c81; background: #fff; color: #0f4c81;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .scenarios button.active { background: #0f4c81; color: #fff; }
+  .row { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 8px 10px; border: 1px solid #b9c4cf;
+    border-radius: 6px; font-size: 13px; font-family: ui-monospace, monospace; }
+  .primary { background: #0f4c81; color: #fff; border: 0; border-radius: 6px;
+    padding: 8px 18px; cursor: pointer; font-size: 14px; }
+  .primary:disabled { opacity: .5; cursor: wait; }
+  .muted { color: #66788a; font-size: 12px; }
+  .ok { color: #137333; } .bad { color: #b3261e; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
+  th, td { border: 1px solid #dde3ea; padding: 5px 7px; text-align: left;
+    vertical-align: top; word-break: break-all; }
+  th { background: #eef3f8; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
+  #forbiddenCount { font-size: 26px; font-weight: 700; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 12px; background: #eef3f8; margin-right: 6px; }
+  a { color: #0f4c81; }
+</style>
+</head>
+<body>
+<header>
+  <h1>水文数据接入采集台</h1>
+  <p>提交合作方 HTTP 链接 → 逐跳白名单裁决 → 下载 ≤256 KiB 原始观测 CSV。仅 IPv4;许可网段与端口由管理员配置。</p>
+</header>
+<main>
+  <section>
+    <h2>采集策略(管理员配置)</h2>
+    <div id="policy" class="muted">加载中…</div>
+  </section>
+
+  <section>
+    <h2>提交采集</h2>
+    <div class="scenarios" id="scenarioBar"></div>
+    <div class="row">
+      <input type="text" id="urlInput" placeholder="http://source.hydro.local:8080/obs.csv">
+      <button class="primary" id="fetchBtn">开始采集</button>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      场景按钮仅填充链接;所有链接都走同一条「逐跳解析 → 全地址核对 → 连已核对地址(保留原 Host)」的防护路径。
+    </div>
+    <div id="result"></div>
+  </section>
+
+  <section>
+    <h2>禁区请求计数(内网管理服务侧)</h2>
+    <div id="forbiddenCount">—</div>
+    <div class="muted">防护生效时,无论「跳转入禁区」还是「DNS 换址」,该计数都应保持不变。每 3 秒自动刷新。</div>
+  </section>
+
+  <section>
+    <h2>采集记录与下载</h2>
+    <div id="attempts" class="muted">暂无记录</div>
+  </section>
+</main>
+<script>
+let scenarios = {};
+let currentScenario = "";
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function loadConfig() {
+  const cfg = await (await fetch("/api/config")).json();
+  scenarios = cfg.scenarios;
+  document.getElementById("policy").innerHTML =
+    `<span class="pill">许可网段:${esc(cfg.allowed_cidrs.join(", "))}</span>` +
+    `<span class="pill">许可端口:${esc(cfg.allowed_ports.join(", "))}</span>` +
+    `<span class="pill">最大跳转:${esc(cfg.max_redirects)} 次</span>` +
+    `<span class="pill">大小上限:${esc(cfg.max_bytes)} 字节(256 KiB)</span>`;
+  const labels = {
+    normal: "正常采集", relative: "相对跳转", forbidden: "跳转入禁区",
+    rebind: "DNS 换址", oversize: "超限文件", loop: "跳转循环(>3 次)"
+  };
+  const bar = document.getElementById("scenarioBar");
+  bar.textContent = "";
+  for (const key of Object.keys(labels)) {
+    const b = document.createElement("button");
+    b.textContent = labels[key];
+    b.onclick = () => {
+      currentScenario = key;
+      document.getElementById("urlInput").value = scenarios[key] || "";
+      for (const x of bar.children) x.classList.remove("active");
+      b.classList.add("active");
+    };
+    bar.appendChild(b);
+  }
+}
+
+function renderResult(rec) {
+  const div = document.getElementById("result");
+  let html = `<h3 style="margin:12px 0 4px">` +
+    (rec.ok ? `<span class="ok">采集成功</span>` : `<span class="bad">采集被拒绝/失败</span>`) + `</h3>`;
+  if (rec.error) html += `<div class="bad">原因:${esc(rec.error)}</div>`;
+  if (rec.ok) {
+    html += `<div>最终 URL:<span class="mono">${esc(rec.final_url)}</span> · ` +
+      `大小:${esc(rec.size)} 字节 · 类型:${esc(rec.content_type)} · ` +
+      `<a href="/api/downloads/${encodeURIComponent(rec.file)}">下载原件 ${esc(rec.orig_name)}</a></div>`;
+  }
+  html += `<table><tr><th>#</th><th>跳 URL</th><th>解析地址(全部核对)</th><th>实际连接</th><th>状态</th><th>裁决</th></tr>`;
+  rec.hops.forEach((h, i) => {
+    html += `<tr><td>${i + 1}</td><td class="mono">${esc(h.url)}</td>` +
+      `<td class="mono">${esc((h.addresses || []).join(", ") || "—")}</td>` +
+      `<td class="mono">${esc(h.connected_to || "—")}</td>` +
+      `<td>${h.status == null ? "—" : esc(h.status)}</td><td>${esc(h.decision)}</td></tr>`;
+  });
+  html += `</table>`;
+  div.innerHTML = html;
+}
+
+async function doFetch() {
+  const btn = document.getElementById("fetchBtn");
+  const url = document.getElementById("urlInput").value.trim();
+  if (!url) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/fetch", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url, scenario: currentScenario})
+    });
+    const rec = await resp.json();
+    renderResult(rec);
+    loadAttempts();
+    refreshForbiddenCount();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadAttempts() {
+  const list = await (await fetch("/api/attempts")).json();
+  const div = document.getElementById("attempts");
+  if (!list.length) { div.textContent = "暂无记录"; div.className = "muted"; return; }
+  div.className = "";
+  let html = `<table><tr><th>时间</th><th>提交 URL</th><th>结果</th><th>大小</th><th>下载</th></tr>`;
+  for (const r of list) {
+    html += `<tr><td class="mono">${esc(r.ts)}</td><td class="mono">${esc(r.input_url)}</td>` +
+      (r.ok ? `<td class="ok">成功</td><td>${esc(r.size)} B</td>` +
+              `<td><a href="/api/downloads/${encodeURIComponent(r.file)}">${esc(r.orig_name)}</a></td>`
+            : `<td class="bad">拒绝:${esc(r.error || "")}</td><td>—</td><td>—</td>`) +
+      `</tr>`;
+  }
+  html += `</table>`;
+  div.innerHTML = html;
+}
+
+async function refreshForbiddenCount() {
+  const el = document.getElementById("forbiddenCount");
+  try {
+    const d = await (await fetch("/api/forbidden-count")).json();
+    if (d.ok) {
+      el.textContent = d.count;
+      el.className = d.count === 0 ? "ok" : "bad";
+    } else {
+      el.textContent = "不可达";
+      el.className = "bad";
+    }
+  } catch (e) {
+    el.textContent = "不可达";
+    el.className = "bad";
+  }
+}
+
+document.getElementById("fetchBtn").onclick = doFetch;
+document.getElementById("urlInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") doFetch();
+});
+loadConfig();
+loadAttempts();
+refreshForbiddenCount();
+setInterval(refreshForbiddenCount, 3000);
+</script>
+</body>
+</html>
